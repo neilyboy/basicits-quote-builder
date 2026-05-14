@@ -11,9 +11,10 @@ export async function GET(req: NextRequest) {
 
   const db = getDb();
   let query = `
-    SELECT p.*, c.name as category_name 
+    SELECT p.*, c.name as category_name, c.parent_id as category_parent_id, pc.name as category_parent_name
     FROM products p 
-    LEFT JOIN categories c ON p.category_id = c.id 
+    LEFT JOIN categories c ON p.category_id = c.id
+    LEFT JOIN categories pc ON c.parent_id = pc.id
     WHERE 1=1
   `;
   const params: unknown[] = [];

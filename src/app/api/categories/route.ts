@@ -7,9 +7,11 @@ export async function GET() {
   const db = getDb();
   const categories = db.prepare(`
     SELECT c.*, 
-      (SELECT COUNT(*) FROM products WHERE category_id = c.id) as product_count
-    FROM categories c 
-    ORDER BY c.sort_order, c.name
+      (SELECT COUNT(*) FROM products WHERE category_id = c.id) as product_count,
+      p.name as parent_name
+    FROM categories c
+    LEFT JOIN categories p ON c.parent_id = p.id
+    ORDER BY COALESCE(c.parent_id, c.id), c.parent_id IS NOT NULL, c.sort_order, c.name
   `).all();
   return NextResponse.json(categories);
 }

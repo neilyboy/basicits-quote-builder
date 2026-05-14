@@ -4,9 +4,11 @@ export interface Category {
   description?: string;
   icon: string;
   parent_id: number | null;
+  parent_name?: string | null;
   sort_order: number;
   created_at: string;
   product_count?: number;
+  subcategories?: Category[];
 }
 
 export type UnitType = 'each' | 'per_foot' | 'per_meter' | 'per_box' | 'per_roll' | 'per_pair' | 'per_set' | 'per_hour' | 'per_month' | 'per_year';
@@ -28,6 +30,8 @@ export interface Product {
   id: number;
   category_id: number | null;
   category_name?: string;
+  category_parent_id?: number | null;
+  category_parent_name?: string | null;
   name: string;
   model_number: string | null;
   description: string | null;

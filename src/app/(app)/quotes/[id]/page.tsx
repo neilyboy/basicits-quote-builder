@@ -28,6 +28,10 @@ export default function QuoteEditorPage() {
   const [editingItem, setEditingItem] = useState<QuoteLineItem | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const exportRef = useRef<HTMLDivElement>(null);
+  const [suggestionContext, setSuggestionContext] = useState<{
+    parentName: string; parentId: number;
+    siblingCategories: { id: number; name: string }[];
+  } | null>(null);
 
   const [editForm, setEditForm] = useState({
     job_name: '', job_description: '', scope_of_work: '', notes: '',
@@ -83,7 +87,7 @@ export default function QuoteEditorPage() {
     item_type: string; product_id?: number; assembly_id?: number; labor_rate_id?: number;
     description?: string; quantity?: number; unit_price?: number; multiplier?: number;
     labor_minutes?: number; notes?: string; unit_type?: string;
-  }) {
+  }, sourceCategoryParentId?: number | null, sourceCategoryId?: number | null) {
     await fetch(`/api/quotes/${quoteId}/items`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(item),
@@ -91,6 +95,13 @@ export default function QuoteEditorPage() {
     await loadQuote();
     setShowAddItem(false);
     setItemSearch('');
+    if (sourceCategoryParentId) {
+      const siblings = categories.filter(c => c.parent_id === sourceCategoryParentId && c.id !== sourceCategoryId);
+      const parent = categories.find(c => c.id === sourceCategoryParentId);
+      if (siblings.length > 0 && parent) {
+        setSuggestionContext({ parentName: parent.name, parentId: sourceCategoryParentId, siblingCategories: siblings.map(s => ({ id: s.id, name: s.name })) });
+      }
+    }
   }
 
   async function updateLineItem(itemId: number, updates: Record<string, unknown>) {
@@ -146,7 +157,16 @@ export default function QuoteEditorPage() {
   const filteredProducts = products.filter(p => {
     const matchSearch = !itemSearch || p.name.toLowerCase().includes(itemSearch.toLowerCase()) ||
       (p.model_number && p.model_number.toLowerCase().includes(itemSearch.toLowerCase()));
-    const matchCat = !selectedCategory || String(p.category_id) === selectedCategory;
+    let matchCat = true;
+    if (selectedCategory) {
+      const catId = Number(selectedCategory);
+      const selectedCat = categories.find(c => c.id === catId);
+      if (selectedCat && !selectedCat.parent_id) {
+        matchCat = p.category_id === catId || p.category_parent_id === catId;
+      } else {
+        matchCat = p.category_id === catId;
+      }
+    }
     return matchSearch && matchCat && p.is_active;
   });
 
@@ -291,6 +311,23 @@ export default function QuoteEditorPage() {
       {/* Line Items Tab */}
       {activeTab === 'items' && (
         <div>
+          {suggestionContext && (
+            <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-xl flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm font-medium text-blue-700">💡 Add related {suggestionContext.parentName} items:</span>
+                {suggestionContext.siblingCategories.map(cat => (
+                  <button key={cat.id} onClick={() => { setSelectedCategory(String(cat.id)); setShowAddItem(true); setSuggestionContext(null); }}
+                    className="text-xs font-medium px-2.5 py-1 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-100 transition-colors">
+                    {cat.name} →
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => setSuggestionContext(null)} className="text-blue-400 hover:text-blue-600 flex-shrink-0">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+          )}
+
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold">Line Items ({lineItems.length})</h2>
             <button onClick={() => setShowAddItem(true)} className="btn-primary btn-sm">
@@ -448,13 +485,28 @@ export default function QuoteEditorPage() {
                     <input className="input flex-1" placeholder="Search products..." value={itemSearch} onChange={e => setItemSearch(e.target.value)} autoFocus />
                     <select className="input w-auto" value={selectedCategory} onChange={e => setSelectedCategory(e.target.value)}>
                       <option value="">All Categories</option>
-                      {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      {(() => {
+                        const parents = categories.filter(c => !c.parent_id);
+                        const flat = categories.filter(c => !c.parent_id && !categories.some(s => s.parent_id === c.id));
+                        const withSubs = parents.filter(p => categories.some(c => c.parent_id === p.id));
+                        return [
+                          ...withSubs.map(parent => (
+                            <optgroup key={parent.id} label={parent.name}>
+                              <option value={parent.id}>— {parent.name} (all)</option>
+                              {categories.filter(c => c.parent_id === parent.id).map(sub => (
+                                <option key={sub.id} value={sub.id}>  {sub.name}</option>
+                              ))}
+                            </optgroup>
+                          )),
+                          ...flat.map(c => <option key={c.id} value={c.id}>{c.name}</option>),
+                        ];
+                      })()}
                     </select>
                   </div>
                   <div className="space-y-1 max-h-[40vh] overflow-y-auto">
                     {filteredProducts.length === 0 ? <p className="text-sm text-slate-500 text-center py-4">No products found. Add products in Admin → Inventory.</p> :
                     filteredProducts.map(p => (
-                      <button key={p.id} onClick={() => addLineItem({ item_type: 'product', product_id: p.id, quantity: 1 })}
+                      <button key={p.id} onClick={() => addLineItem({ item_type: 'product', product_id: p.id, quantity: 1 }, p.category_parent_id, p.category_id)}
                         className="w-full text-left p-3 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors">
                         <div className="flex items-center justify-between">
                           <div>

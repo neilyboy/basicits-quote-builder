@@ -235,6 +235,110 @@ function handleCsvImport(data: string, categoryId?: number) {
   return NextResponse.json({ items, source: 'csv' });
 }
 
+function mapVerkadaToHierarchy(productFamily: string, name: string, model: string): { parent: string; sub: string } | null {
+  const fam = productFamily.toLowerCase().trim();
+  const nm = name.toLowerCase();
+  const mdl = model.toUpperCase().trim();
+
+  const isLicense = nm.includes('license') || mdl.startsWith('VK-') || fam.includes('license') || fam.includes('cmd');
+  const isAccessory = mdl.startsWith('ACC-') || fam.includes('accessor') || fam.includes('mount') ||
+    fam.includes('bracket') || fam.includes('injector') || fam.includes('power supply') ||
+    mdl.startsWith('POE') || nm.includes('mount') || nm.includes('bracket') || nm.includes('injector');
+
+  if (/camera|dome|fisheye|multisensor|ptz|doorbell|license plate|turret|bullet|corridor/.test(fam) ||
+      /^(cd|ch|cm|cf|cp|cs|cv)\d/.test(mdl.toLowerCase())) {
+    const parent = 'Video Security';
+    if (isLicense) return { parent, sub: 'Camera Licenses' };
+    if (isAccessory) return { parent, sub: 'Camera Accessories' };
+    return { parent, sub: 'Cameras' };
+  }
+  if (isAccessory && /video|security|surveillance|camera/.test(fam)) {
+    return { parent: 'Video Security', sub: 'Camera Accessories' };
+  }
+  if (/door controller|access control|card reader|keypad|wireless lock|reader|controller/.test(fam) ||
+      /^(ac|dl|ds)\d/.test(mdl.toLowerCase())) {
+    const parent = 'Access Control';
+    if (isLicense) return { parent, sub: 'Access Control Licenses' };
+    if (/reader|keypad/.test(fam)) return { parent, sub: 'Card Readers' };
+    if (/lock/.test(fam)) return { parent, sub: 'Wireless Locks' };
+    return { parent, sub: 'Door Controllers' };
+  }
+  if (/intercom/.test(fam) || /^ix/.test(mdl.toLowerCase())) {
+    const parent = 'Intercom';
+    if (isLicense) return { parent, sub: 'Intercom Licenses' };
+    return { parent, sub: 'Intercom Hardware' };
+  }
+  if (/air quality|environmental/.test(fam) || /^(sv|aq)\d/.test(mdl.toLowerCase())) {
+    const parent = 'Environmental';
+    if (isLicense) return { parent, sub: 'Sensor Licenses' };
+    return { parent, sub: 'Air Quality Sensors' };
+  }
+  if (/alarm/.test(fam) || /^(gv|sp)\d/.test(mdl.toLowerCase())) {
+    const parent = 'Alarms';
+    if (isLicense) return { parent, sub: 'Alarm Licenses' };
+    return { parent, sub: 'Alarm Hardware' };
+  }
+  if (/workplace|people counting|desk/.test(fam)) {
+    const parent = 'Workplace';
+    if (isLicense) return { parent, sub: 'Workplace Licenses' };
+    return { parent, sub: 'Workplace Hardware' };
+  }
+  return null;
+}
+
+function buildCategoryHelpers(db: ReturnType<typeof getDb>) {
+  const categoryCache = new Map<string, number>();
+  const existingCats = db.prepare('SELECT id, name, parent_id FROM categories').all() as Array<{ id: number; name: string; parent_id: number | null }>;
+  existingCats.forEach(c => {
+    if (c.parent_id) {
+      categoryCache.set(`__sub__${c.parent_id}__${c.name.toLowerCase()}`, c.id);
+    } else {
+      categoryCache.set(c.name.toLowerCase(), c.id);
+    }
+  });
+
+  const insertFlat = db.prepare('INSERT INTO categories (name) VALUES (?)');
+  const insertSub = db.prepare('INSERT INTO categories (name, parent_id) VALUES (?, ?)');
+
+  function getOrCreateCategory(suggestion: string, name = '', model = ''): number | null {
+    if (!suggestion) return null;
+
+    const hierarchy = mapVerkadaToHierarchy(suggestion, name, model);
+    if (hierarchy) {
+      const parentKey = hierarchy.parent.toLowerCase();
+      let parentId: number;
+      if (categoryCache.has(parentKey)) {
+        parentId = categoryCache.get(parentKey)!;
+      } else {
+        const r = insertFlat.run(hierarchy.parent);
+        parentId = Number(r.lastInsertRowid);
+        categoryCache.set(parentKey, parentId);
+      }
+      const subKey = `__sub__${parentId}__${hierarchy.sub.toLowerCase()}`;
+      if (categoryCache.has(subKey)) return categoryCache.get(subKey)!;
+      const r = insertSub.run(hierarchy.sub, parentId);
+      const subId = Number(r.lastInsertRowid);
+      categoryCache.set(subKey, subId);
+      return subId;
+    }
+
+    // Fallback: flat category from suggestion string
+    const catName = suggestion.includes(' - ') ? suggestion.split(' - ')[0].trim() : suggestion.trim();
+    if (!catName) return null;
+    const key = catName.toLowerCase();
+    if (categoryCache.has(key)) return categoryCache.get(key)!;
+    const r = insertFlat.run(catName);
+    const id = Number(r.lastInsertRowid);
+    categoryCache.set(key, id);
+    return id;
+  }
+
+  const startCount = existingCats.length;
+  const getCategoriesCreated = () => categoryCache.size - startCount;
+
+  return { getOrCreateCategory, getCategoriesCreated };
+}
+
 function handleConfirmImport(items: Array<{
   name: string; model_number: string; price: number; category_id?: number;
   category_suggestion?: string;
@@ -243,28 +347,7 @@ function handleConfirmImport(items: Array<{
   if (!items || !items.length) return NextResponse.json({ error: 'No items' }, { status: 400 });
 
   const db = getDb();
-
-  // Auto-create categories from category_suggestion if no category_id provided
-  const categoryCache = new Map<string, number>();
-  const existingCats = db.prepare('SELECT id, name FROM categories').all() as Array<{ id: number; name: string }>;
-  existingCats.forEach(c => categoryCache.set(c.name.toLowerCase(), c.id));
-
-  const insertCat = db.prepare('INSERT INTO categories (name) VALUES (?)');
-
-  function getOrCreateCategory(suggestion: string): number | null {
-    if (!suggestion) return null;
-    // Use the product family (first part before " - ") as the category name
-    const catName = suggestion.includes(' - ') ? suggestion.split(' - ')[0].trim() : suggestion.trim();
-    if (!catName) return null;
-
-    const key = catName.toLowerCase();
-    if (categoryCache.has(key)) return categoryCache.get(key)!;
-
-    const result = insertCat.run(catName);
-    const id = Number(result.lastInsertRowid);
-    categoryCache.set(key, id);
-    return id;
-  }
+  const { getOrCreateCategory, getCategoriesCreated } = buildCategoryHelpers(db);
 
   const insert = db.prepare(`
     INSERT INTO products (name, model_number, unit_price, category_id, description, unit_type, quantity_per_unit)
@@ -272,12 +355,10 @@ function handleConfirmImport(items: Array<{
   `);
 
   let imported = 0;
-  let categoriesCreated = 0;
-  const startCatCount = existingCats.length;
 
   const importMany = db.transaction((importItems: typeof items) => {
     for (const item of importItems) {
-      const catId = item.category_id || getOrCreateCategory(item.category_suggestion || '');
+      const catId = item.category_id || getOrCreateCategory(item.category_suggestion || '', item.name, item.model_number || '');
       insert.run(
         item.name, item.model_number || null, item.price || 0,
         catId, item.description || null,
@@ -288,7 +369,7 @@ function handleConfirmImport(items: Array<{
   });
 
   importMany(items);
-  categoriesCreated = categoryCache.size - startCatCount;
+  const categoriesCreated = getCategoriesCreated();
   return NextResponse.json({ success: true, imported, categoriesCreated });
 }
 
@@ -319,36 +400,20 @@ async function handleRecategorize(url: string) {
     }
 
     const db = getDb();
-
-    // Get or create categories
-    const categoryCache = new Map<string, number>();
-    const existingCats = db.prepare('SELECT id, name FROM categories').all() as Array<{ id: number; name: string }>;
-    existingCats.forEach(c => categoryCache.set(c.name.toLowerCase(), c.id));
-
-    const insertCat = db.prepare('INSERT INTO categories (name) VALUES (?)');
-    const getOrCreateCat = (name: string): number => {
-      const key = name.toLowerCase();
-      if (categoryCache.has(key)) return categoryCache.get(key)!;
-      const result = insertCat.run(name);
-      const id = Number(result.lastInsertRowid);
-      categoryCache.set(key, id);
-      return id;
-    };
+    const { getOrCreateCategory, getCategoriesCreated } = buildCategoryHelpers(db);
 
     // Get all products and update their categories
     const products = db.prepare('SELECT id, model_number, name FROM products').all() as Array<{ id: number; model_number: string | null; name: string }>;
     const updateStmt = db.prepare('UPDATE products SET category_id = ? WHERE id = ?');
 
     let updated = 0;
-    let categoriesCreated = 0;
-    const startCatCount = existingCats.length;
 
     const updateMany = db.transaction(() => {
       for (const product of products) {
         const sku = (product.model_number || product.name || '').toUpperCase();
         const family = skuToCategory.get(sku);
         if (family) {
-          const catId = getOrCreateCat(family);
+          const catId = getOrCreateCategory(family, product.name, product.model_number || '');
           updateStmt.run(catId, product.id);
           updated++;
         }
@@ -356,7 +421,7 @@ async function handleRecategorize(url: string) {
     });
     updateMany();
 
-    categoriesCreated = categoryCache.size - startCatCount;
+    const categoriesCreated = getCategoriesCreated();
     return NextResponse.json({
       success: true,
       updated,

@@ -32,14 +32,16 @@ export default function AssembliesPage() {
     setShowForm(true);
   }
 
-  function openEdit(a: Assembly) {
+  async function openEdit(a: Assembly) {
     setEditing(a);
     setForm({
       name: a.name, description: a.description || '',
       default_multiplier: a.default_multiplier, default_labor_minutes: a.default_labor_minutes,
       default_labor_rate_id: a.default_labor_rate_id ? String(a.default_labor_rate_id) : '',
     });
-    setComponents((a.components || []).map(c => ({ product_id: c.product_id, quantity: c.quantity })));
+    const res = await fetch(`/api/assemblies?id=${a.id}`);
+    const full = await res.json();
+    setComponents((full.components || []).map((c: { product_id: number; quantity: number }) => ({ product_id: c.product_id, quantity: c.quantity })));
     setShowForm(true);
   }
 
@@ -102,7 +104,7 @@ export default function AssembliesPage() {
                 <h3 className="font-semibold text-slate-900">{a.name}</h3>
                 {a.description && <p className="text-sm text-slate-500 mt-0.5">{a.description}</p>}
                 <div className="flex gap-4 text-xs text-slate-400 mt-2">
-                  <span>{(a.components || []).length} components</span>
+                  <span>{(a as unknown as Record<string, number>).component_count ?? (a.components || []).length} components</span>
                   <span>{a.default_labor_minutes} min labor</span>
                   <span>×{a.default_multiplier} multiplier</span>
                 </div>
