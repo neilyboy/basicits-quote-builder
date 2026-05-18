@@ -90,6 +90,23 @@ export default function ImportPage() {
     setImporting(false);
   }
 
+  async function migrateHierarchy() {
+    setLoading(true);
+    setResult('');
+    const res = await fetch('/api/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'migrate-hierarchy' }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      setResult(`Migrated ${data.updated} products into subcategory hierarchy! ${data.categoriesCreated} new categories created. (${data.skipped} products had unrecognized categories and were left unchanged.)`);
+    } else {
+      setResult(`Error: ${data.error}`);
+    }
+    setLoading(false);
+  }
+
   async function recategorizeExisting() {
     const verkadaUrl = 'https://www.verkada.com/pricing/';
     setLoading(true);
@@ -165,11 +182,21 @@ export default function ImportPage() {
             <input className="input flex-1" placeholder="https://www.verkada.com/security-cameras/pricing/" value={url} onChange={e => setUrl(e.target.value)} onKeyDown={e => e.key === 'Enter' && fetchUrl()} />
             <button onClick={fetchUrl} disabled={loading || !url.trim()} className="btn-primary">{loading ? 'Fetching...' : 'Fetch'}</button>
           </div>
-          <div className="mt-4 pt-4 border-t border-slate-100">
-            <p className="text-sm text-slate-500 mb-2">Already imported products but need to fix categories?</p>
-            <button onClick={recategorizeExisting} disabled={loading} className="btn-secondary text-sm">
-              {loading ? 'Processing...' : 'Re-categorize Existing Products from Verkada'}
-            </button>
+          <div className="mt-4 pt-4 border-t border-slate-100 space-y-3">
+            <div>
+              <p className="text-sm font-medium text-slate-700 mb-1">Migrate to subcategory hierarchy</p>
+              <p className="text-xs text-slate-400 mb-2">Splits your existing flat categories (Camera, Access Control, etc.) into parent + subcategories (Video Security › Cameras, Camera Licenses, Camera Accessories). Run this once after updating.</p>
+              <button onClick={migrateHierarchy} disabled={loading} className="btn-primary text-sm">
+                {loading ? 'Processing...' : '⚡ Migrate Existing Products to Hierarchy'}
+              </button>
+            </div>
+            <div>
+              <p className="text-sm font-medium text-slate-700 mb-1">Re-categorize from Verkada (requires internet)</p>
+              <p className="text-xs text-slate-400 mb-2">Re-fetches the Verkada pricing page and maps products by SKU.</p>
+              <button onClick={recategorizeExisting} disabled={loading} className="btn-secondary text-sm">
+                {loading ? 'Processing...' : 'Re-categorize Existing Products from Verkada'}
+              </button>
+            </div>
           </div>
         </div>
       )}

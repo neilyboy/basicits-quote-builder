@@ -22,6 +22,10 @@ export async function POST(req: NextRequest) {
     return handleRecategorize(body.url);
   }
 
+  if (body.type === 'migrate-hierarchy') {
+    return handleMigrateHierarchy();
+  }
+
   return NextResponse.json({ error: 'Invalid import type' }, { status: 400 });
 }
 
@@ -333,10 +337,28 @@ function buildCategoryHelpers(db: ReturnType<typeof getDb>) {
     return id;
   }
 
+  function getOrCreateHierarchy(parent: string, sub: string): number {
+    const parentKey = parent.toLowerCase();
+    let parentId: number;
+    if (categoryCache.has(parentKey)) {
+      parentId = categoryCache.get(parentKey)!;
+    } else {
+      const r = insertFlat.run(parent);
+      parentId = Number(r.lastInsertRowid);
+      categoryCache.set(parentKey, parentId);
+    }
+    const subKey = `__sub__${parentId}__${sub.toLowerCase()}`;
+    if (categoryCache.has(subKey)) return categoryCache.get(subKey)!;
+    const r = insertSub.run(sub, parentId);
+    const subId = Number(r.lastInsertRowid);
+    categoryCache.set(subKey, subId);
+    return subId;
+  }
+
   const startCount = existingCats.length;
   const getCategoriesCreated = () => categoryCache.size - startCount;
 
-  return { getOrCreateCategory, getCategoriesCreated };
+  return { getOrCreateCategory, getOrCreateHierarchy, getCategoriesCreated };
 }
 
 function handleConfirmImport(items: Array<{
@@ -371,6 +393,52 @@ function handleConfirmImport(items: Array<{
   importMany(items);
   const categoriesCreated = getCategoriesCreated();
   return NextResponse.json({ success: true, imported, categoriesCreated });
+}
+
+function handleMigrateHierarchy() {
+  const FLAT_TO_HIERARCHY: Record<string, { parent: string; base: string; licenseSub: string; accessorySub: string }> = {
+    'camera':               { parent: 'Video Security',  base: 'Cameras',           licenseSub: 'Camera Licenses',           accessorySub: 'Camera Accessories' },
+    'intercom':             { parent: 'Intercom',        base: 'Intercom Hardware', licenseSub: 'Intercom Licenses',         accessorySub: 'Intercom Accessories' },
+    'access control':       { parent: 'Access Control',  base: 'Door Controllers',  licenseSub: 'Access Control Licenses',   accessorySub: 'Access Control Accessories' },
+    'platform accessories': { parent: 'Video Security',  base: 'Camera Accessories',licenseSub: 'Camera Accessories',        accessorySub: 'Camera Accessories' },
+    'sensor':               { parent: 'Environmental',   base: 'Air Quality Sensors',licenseSub: 'Sensor Licenses',          accessorySub: 'Sensor Accessories' },
+    'alarm':                { parent: 'Alarms',          base: 'Alarm Hardware',    licenseSub: 'Alarm Licenses',            accessorySub: 'Alarm Accessories' },
+    'workplace':            { parent: 'Workplace',       base: 'Workplace Hardware',licenseSub: 'Workplace Licenses',        accessorySub: 'Workplace Accessories' },
+  };
+
+  const db = getDb();
+  const { getOrCreateHierarchy, getCategoriesCreated } = buildCategoryHelpers(db);
+
+  const products = db.prepare(`
+    SELECT p.id, p.name, p.model_number, c.name as category_name
+    FROM products p
+    LEFT JOIN categories c ON p.category_id = c.id
+    WHERE c.parent_id IS NULL AND c.name IS NOT NULL
+  `).all() as Array<{ id: number; name: string; model_number: string | null; category_name: string }>;
+
+  const updateStmt = db.prepare('UPDATE products SET category_id = ? WHERE id = ?');
+  let updated = 0;
+  let skipped = 0;
+
+  const migrate = db.transaction(() => {
+    for (const product of products) {
+      const mapping = FLAT_TO_HIERARCHY[product.category_name.toLowerCase()];
+      if (!mapping) { skipped++; continue; }
+
+      const nm = product.name.toLowerCase();
+      const mdl = (product.model_number || '').toUpperCase();
+      const isLicense = nm.includes('license') || mdl.startsWith('VK-');
+      const isAccessory = mdl.startsWith('ACC-') || nm.includes(' mount') || nm.includes('bracket') || nm.includes('injector') || nm.startsWith('poe ');
+
+      const sub = isLicense ? mapping.licenseSub : isAccessory ? mapping.accessorySub : mapping.base;
+      const catId = getOrCreateHierarchy(mapping.parent, sub);
+      updateStmt.run(catId, product.id);
+      updated++;
+    }
+  });
+  migrate();
+
+  return NextResponse.json({ success: true, updated, skipped, categoriesCreated: getCategoriesCreated() });
 }
 
 async function handleRecategorize(url: string) {
