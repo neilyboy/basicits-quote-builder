@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { getDb, generateQuoteNumber, generateShareToken } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,7 +26,189 @@ export async function POST(req: NextRequest) {
     return handleMigrateHierarchy();
   }
 
+  if (body.type === 'siteplan-parse') {
+    return handleSitePlanParse(body.csv);
+  }
+
+  if (body.type === 'siteplan-confirm') {
+    return handleSitePlanConfirm(body);
+  }
+
   return NextResponse.json({ error: 'Invalid import type' }, { status: 400 });
+}
+
+function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let field = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuote && line[i + 1] === '"') { field += '"'; i++; }
+      else { inQuote = !inQuote; }
+    } else if (ch === ',' && !inQuote) {
+      fields.push(field); field = '';
+    } else {
+      field += ch;
+    }
+  }
+  fields.push(field);
+  return fields;
+}
+
+function handleSitePlanParse(csv: string) {
+  if (!csv?.trim()) return NextResponse.json({ error: 'CSV data required' }, { status: 400 });
+
+  const lines = csv.trim().split('\n').map(l => l.replace(/\r$/, '').trim()).filter(Boolean);
+  if (lines.length < 2) return NextResponse.json({ error: 'CSV has no data rows' }, { status: 400 });
+
+  const headers = parseCsvLine(lines[0]);
+  const required = ['SKU', 'Quantity', 'MSRP'];
+  const missing = required.filter(h => !headers.includes(h));
+  if (missing.length > 0) {
+    return NextResponse.json({
+      error: `Missing required columns: ${missing.join(', ')}. Make sure this is a Verkada Site Planner CSV export.`
+    }, { status: 400 });
+  }
+
+  const col = (name: string) => headers.indexOf(name);
+  const iSku = col('SKU'), iQty = col('Quantity'), iMsrp = col('MSRP');
+  const iProject = col('Project Name'), iLocation = col('Location Name'), iPlan = col('Plan Name');
+
+  let projectName = '';
+  let locationName = '';
+  const plansSet = new Set<string>();
+  const skuMap = new Map<string, { quantity: number; msrp: number; plans: Set<string> }>();
+
+  for (let i = 1; i < lines.length; i++) {
+    const f = parseCsvLine(lines[i]);
+    const sku = f[iSku]?.trim();
+    if (!sku) continue;
+
+    if (!projectName && iProject >= 0) projectName = f[iProject]?.trim() || '';
+    if (!locationName && iLocation >= 0) locationName = f[iLocation]?.trim() || '';
+    const plan = iPlan >= 0 ? (f[iPlan]?.trim() || '') : '';
+    if (plan) plansSet.add(plan);
+
+    const qty = parseInt(f[iQty] || '1', 10) || 1;
+    const msrp = parseFloat((f[iMsrp] || '0').replace(/[$,]/g, '')) || 0;
+
+    const existing = skuMap.get(sku);
+    if (existing) {
+      existing.quantity += qty;
+      if (plan) existing.plans.add(plan);
+    } else {
+      skuMap.set(sku, { quantity: qty, msrp, plans: new Set(plan ? [plan] : []) });
+    }
+  }
+
+  if (skuMap.size === 0) return NextResponse.json({ error: 'No valid SKUs found in CSV' }, { status: 400 });
+
+  const db = getDb();
+  const items = Array.from(skuMap.entries()).map(([sku, data]) => {
+    const product = db.prepare(
+      'SELECT id, name, model_number, unit_price, unit_type FROM products WHERE UPPER(model_number) = UPPER(?) AND is_active = 1 LIMIT 1'
+    ).get(sku) as { id: number; name: string; model_number: string; unit_price: number; unit_type: string } | undefined;
+    return {
+      sku,
+      quantity: data.quantity,
+      msrp: data.msrp,
+      plans: Array.from(data.plans),
+      found: !!product,
+      product_id: product?.id ?? null,
+      product_name: product?.name ?? null,
+      unit_price: product?.unit_price ?? data.msrp,
+      unit_type: product?.unit_type ?? 'each',
+    };
+  });
+
+  items.sort((a, b) => (b.found ? 1 : 0) - (a.found ? 1 : 0));
+
+  return NextResponse.json({
+    projectName,
+    locationName,
+    plans: Array.from(plansSet),
+    totalRows: lines.length - 1,
+    matchedCount: items.filter(i => i.found).length,
+    notFoundCount: items.filter(i => !i.found).length,
+    items,
+  });
+}
+
+function handleSitePlanConfirm(body: {
+  items: Array<{
+    sku: string; product_id: number | null; product_name: string | null;
+    quantity: number; unit_price: number; unit_type: string; found: boolean;
+  }>;
+  job_name: string; customer_name?: string; customer_company?: string;
+  customer_email?: string; customer_phone?: string;
+}) {
+  const { items, job_name, customer_name, customer_company, customer_email, customer_phone } = body;
+  if (!job_name?.trim()) return NextResponse.json({ error: 'Job name required' }, { status: 400 });
+  if (!items?.length) return NextResponse.json({ error: 'No items provided' }, { status: 400 });
+
+  const db = getDb();
+  const quote_number = generateQuoteNumber(db);
+  const share_token = generateShareToken();
+
+  const quoteResult = db.prepare(`
+    INSERT INTO quotes (quote_number, job_name, customer_name, customer_company, customer_email, customer_phone, share_token, tax_rate, discount_amount, discount_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'flat')
+  `).run(quote_number, job_name.trim(), customer_name || null, customer_company || null, customer_email || null, customer_phone || null, share_token);
+
+  const quoteId = Number(quoteResult.lastInsertRowid);
+
+  const insertItem = db.prepare(`
+    INSERT INTO quote_line_items
+      (quote_id, sort_order, item_type, product_id, description, quantity, unit_type, unit_price, multiplier, labor_minutes, line_total, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0, ?, ?)
+  `);
+
+  const insertAll = db.transaction(() => {
+    items.forEach((item, idx) => {
+      let description: string;
+      let unitPrice = item.unit_price;
+      let unitType = item.unit_type || 'each';
+
+      if (item.product_id) {
+        const p = db.prepare('SELECT name, model_number, unit_price, unit_type FROM products WHERE id = ?')
+          .get(item.product_id) as { name: string; model_number: string | null; unit_price: number; unit_type: string } | undefined;
+        if (p) {
+          description = p.name + (p.model_number ? ` (${p.model_number})` : '');
+          unitPrice = item.unit_price; // respect user-edited price
+          unitType = p.unit_type;
+        } else {
+          description = item.sku;
+        }
+      } else {
+        description = `${item.sku} — not in catalog`;
+      }
+
+      const lineTotal = unitPrice * item.quantity;
+      const notes = !item.product_id
+        ? `SKU "${item.sku}" was not found in the product catalog. Price sourced from Verkada Site Planner MSRP.`
+        : null;
+
+      insertItem.run(
+        quoteId, idx + 1,
+        item.product_id ? 'product' : 'custom',
+        item.product_id,
+        description,
+        item.quantity,
+        unitType,
+        unitPrice,
+        lineTotal,
+        notes
+      );
+    });
+  });
+  insertAll();
+
+  const lineItems = db.prepare('SELECT line_total FROM quote_line_items WHERE quote_id = ?').all(quoteId) as Array<{ line_total: number }>;
+  const subtotal = lineItems.reduce((s, li) => s + (li.line_total || 0), 0);
+  db.prepare('UPDATE quotes SET subtotal=?, tax_amount=0, total=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal, subtotal, quoteId);
+
+  return NextResponse.json({ success: true, quote_id: quoteId, quote_number });
 }
 
 async function handleUrlImport(url: string) {
